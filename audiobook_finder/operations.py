@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -17,6 +18,7 @@ REVIEW_DIRECTORY = "_Audiobook Review"
 LOG_NAME = "_move-log.jsonl"
 INVALID_WINDOWS_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED_WINDOWS_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+LOGGER = logging.getLogger(__name__)
 
 
 def _safe_name(value: str) -> str:
@@ -78,7 +80,9 @@ def move_edition(edition: Edition, library_root: Path) -> tuple[tuple[str, str],
                 "destination": str(destination), "timestamp": timestamp,
             })
         _append_event(log_path, {"event": "complete", "transaction": identity, "timestamp": timestamp})
+        LOGGER.info("Moved %d files for edition %r into review (transaction=%s)", len(moved), edition.title, identity)
     except Exception:
+        LOGGER.exception("Move failed for edition %r (transaction=%s); rolling back", edition.title, identity)
         for source, destination in reversed(moved):
             source.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists() and not source.exists():
@@ -145,4 +149,5 @@ def undo_last_move(library_root: Path) -> tuple[tuple[str, str], ...]:
         "event": "undone", "transaction": transaction,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+    LOGGER.info("Undid move transaction %s; restored %d files", transaction, len(restored))
     return tuple(restored)

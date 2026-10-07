@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -20,6 +22,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QVBoxLayout,
@@ -28,8 +31,27 @@ from PySide6.QtWidgets import (
 
 from .matching import Confidence, Edition, preference_key
 from .operations import move_edition, undo_last_move
-from .settings import load_library_path, save_library_path, validate_library_path
+from .scanner import _fpcalc_available
+from .settings import load_library_path, save_library_path, settings_path, validate_library_path
 from .workflow import WorkflowResult, scan_and_process
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _configure_logging() -> Path:
+    log_path = settings_path().parent / "audiobook-finder.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    root_logger = logging.getLogger()
+    if not any(getattr(handler, "_audiobook_finder_log", False) for handler in root_logger.handlers):
+        handler = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        handler._audiobook_finder_log = True
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        ))
+        root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+    return log_path
 
 
 def _duration(seconds: float) -> str:
@@ -75,6 +97,7 @@ class ScanWorker(QObject):
             )
             self.completed.emit(result)
         except Exception as error:
+            LOGGER.exception("Scan failed for %s", self.root)
             self.failed.emit(str(error))
 
 
@@ -89,6 +112,7 @@ class MainWindow(QMainWindow):
         self._cancellation: threading.Event | None = None
         self._result: WorkflowResult | None = None
         self._review_groups = []
+        self._include_fingerprints = False
 
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -134,6 +158,12 @@ class MainWindow(QMainWindow):
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("scanProgress")
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(12)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
 
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.HLine)
@@ -192,6 +222,8 @@ class MainWindow(QMainWindow):
             QLabel#heading { color: #163b34; }
             QLabel#sectionTitle { color: #163b34; font-size: 15px; font-weight: 650; }
             QLabel#status { background: #e9efec; border-left: 3px solid #267866; padding: 10px 12px; }
+            QProgressBar#scanProgress { background: #dce5e0; border: 0; border-radius: 2px; }
+            QProgressBar#scanProgress::chunk { background: #267866; border-radius: 2px; }
             QLabel#muted { color: #63726d; }
             QLabel#groupDetail { color: #364541; padding-bottom: 8px; }
             QLineEdit, QListWidget { background: #ffffff; border: 1px solid #cbd5d0; border-radius: 4px; padding: 8px; }
@@ -223,14 +255,40 @@ class MainWindow(QMainWindow):
             save_library_path(library_path)
         except OSError as error:
             QMessageBox.warning(self, "Could not save default folder", str(error))
+        self._include_fingerprints = self.fingerprint_checkbox.isChecked()
+        if self._include_fingerprints and not _fpcalc_available():
+            answer = QMessageBox.warning(
+                self,
+                "fpcalc is not available",
+                "Audio fingerprinting is checked, but fpcalc could not be launched.\n\n"
+                "To enable it, install the Windows Chromaprint fpcalc utility from "
+                "https://acoustid.org/chromaprint, add the folder containing fpcalc.exe "
+                "to PATH, or set FPCALC to the full executable path, then restart the app.\n\n"
+                "Continue this scan without audio fingerprinting?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                LOGGER.info("Scan cancelled before start because fpcalc is unavailable")
+                return
+            self.fingerprint_checkbox.setChecked(False)
+            self._include_fingerprints = False
         self.group_list.clear()
         self.edition_list.clear()
         self.group_detail.setText("Scanning files and comparing audiobook editions…")
+        self.status.setText("Scanning library: discovering files and checking metadata…")
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.show()
+        LOGGER.info(
+            "Scan started for %s (fingerprinting=%s)",
+            library_path,
+            self._include_fingerprints,
+        )
         self._set_running(True)
         self._cancellation = threading.Event()
         self._thread = QThread(self)
         self._worker = ScanWorker(
-            library_path, self._cancellation, self.fingerprint_checkbox.isChecked()
+            library_path, self._cancellation, self._include_fingerprints
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -252,11 +310,18 @@ class MainWindow(QMainWindow):
         moved_editions = len(result.moved)
         if result.cancelled:
             message = "Scan cancelled. No automatic moves were made."
+            LOGGER.info("Scan cancelled for %s", self.path_edit.text())
         else:
             message = (
                 f"Scan complete · {result.edition_count:,} editions · "
                 f"moved {moved_files:,} files from {moved_editions:,} strong duplicate editions · "
                 f"{len(result.review_groups):,} groups need review · {len(result.issues):,} unreadable files"
+            )
+            LOGGER.info(
+                "Scan completed for %s: editions=%d groups_for_review=%d moved_editions=%d "
+                "moved_files=%d issues=%d",
+                self.path_edit.text(), result.edition_count, len(result.review_groups),
+                moved_editions, moved_files, len(result.issues),
             )
         self.status.setText(message)
         self._populate_review_queue()
@@ -267,6 +332,9 @@ class MainWindow(QMainWindow):
 
     def _thread_finished(self) -> None:
         self._set_running(False)
+        self.progress_bar.hide()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
         self._worker = None
         self._thread = None
 
@@ -342,11 +410,15 @@ class MainWindow(QMainWindow):
             for edition in moving:
                 move_edition(edition, root)
         except Exception as error:
+            LOGGER.exception("Manual duplicate move failed")
             QMessageBox.critical(self, "Move failed", str(error))
             return
         self._resolve_current_group(f"Moved {file_count} files to review.")
 
     def _keep_review_group(self) -> None:
+        row = self.group_list.currentRow()
+        if row >= 0:
+            LOGGER.info("Kept all editions in review group %r", self._review_groups[row].editions[0].title)
         self._resolve_current_group("Kept all editions in place.")
 
     def _resolve_current_group(self, message: str) -> None:
@@ -380,10 +452,13 @@ class MainWindow(QMainWindow):
             restored = undo_last_move(Path(selected))
             self.status.setText(f"Restored {len(restored)} files to their original locations.")
         except Exception as error:
+            LOGGER.exception("Undo move failed")
             QMessageBox.warning(self, "Undo unavailable", str(error))
 
 
 def main() -> int:
+    log_path = _configure_logging()
+    LOGGER.info("Audiobook Duplicate Finder started; log file: %s", log_path)
     application = QApplication(sys.argv)
     application.setApplicationName("Audiobook Duplicate Finder")
     window = MainWindow()

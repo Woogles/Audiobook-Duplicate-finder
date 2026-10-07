@@ -112,7 +112,21 @@ def _fingerprint_audio(path: Path) -> tuple[float, str]:
 
 def _fpcalc_available() -> bool:
     command = os.environ.get("FPCALC", "fpcalc")
-    return bool(shutil.which(command) or Path(command).is_file())
+    executable = shutil.which(command)
+    if executable is None and Path(command).is_file():
+        executable = str(Path(command))
+    if executable is None:
+        return False
+    try:
+        subprocess.run(
+            [executable, "-version"],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 def inspect_file(path: Path, should_cancel: Callable[[], bool] | None = None) -> AudioFileInfo:
@@ -184,7 +198,17 @@ def scan_directory(
         raise NotADirectoryError(root)
 
     candidates: list[Path] = []
-    for current, directories, filenames in os.walk(root, followlinks=False):
+    issues: list[ScanIssue] = []
+
+    def record_walk_error(error: OSError) -> None:
+        issues.append(ScanIssue(
+            str(error.filename or root),
+            f"Directory could not be scanned: {error}",
+        ))
+
+    for current, directories, filenames in os.walk(
+        root, followlinks=False, onerror=record_walk_error
+    ):
         directories[:] = sorted(
             name for name in directories
             if not (Path(current) / name).is_symlink()
@@ -196,10 +220,9 @@ def scan_directory(
                 candidates.append(candidate)
 
     discovered: list[AudioFileInfo] = []
-    issues: list[ScanIssue] = []
     fingerprinting = include_fingerprints
     if fingerprinting and not _fpcalc_available():
-        issues.append(ScanIssue(str(root), "Audio fingerprinting needs pyacoustid and fpcalc (Chromaprint)."))
+        issues.append(ScanIssue(str(root), "Audio fingerprinting needs the Chromaprint fpcalc executable."))
         fingerprinting = False
     for index, candidate in enumerate(sorted(candidates), start=1):
         if should_cancel and should_cancel():

@@ -31,6 +31,10 @@ To run the test suite, install the test extra and run `python -m unittest discov
 
 Audio fingerprinting is optional and off by default. Enable the checkbox in the app after making the local Chromaprint `fpcalc` executable available on `PATH`; alternatively, set the `FPCALC` environment variable to its full path. This pass reads the audio again and can take a long time for a multi-terabyte library. Nothing is sent over the network.
 
+When fingerprinting is checked, the app verifies that `fpcalc` can be launched before scanning. If it is unavailable, the app shows Windows setup instructions and lets you continue without fingerprinting. Scan activity is shown while folders are enumerated and files are inspected. The application log is written to `%LOCALAPPDATA%\AudiobookDuplicateFinder\audiobook-finder.log` with up to three rotated backups; move and undo operations also retain their per-library reversible transaction log.
+
+Mounted SMB and NFS folders can be selected through a mapped drive or a UNC path, provided Windows can read the share. Remote scans can be slow, especially during folder enumeration or hashing, and the activity indicator remains active during that time. The share must remain mounted and writable for review moves and undo; SMB/NFS server permissions and rename behavior apply. Unavailable or unreadable folders and files are recorded as scan issues and in the application log. The app does not connect to shares itself or transfer audio elsewhere.
+
 ## Review Flow
 
 The scan reads supported audio files recursively and does not modify them. It records SHA-256 hashes, available tags, duration, bitrate, lossless format, chapter information, and cover presence. The `_Audiobook Review` folder is excluded from later scans.

@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from audiobook_finder.scanner import AUDIO_EXTENSIONS, scan_directory
+from audiobook_finder.scanner import AUDIO_EXTENSIONS, _fpcalc_available, scan_directory
 
 
 class ScannerTests(unittest.TestCase):
@@ -64,6 +64,29 @@ class ScannerTests(unittest.TestCase):
 
             self.assertEqual(len(result.files), 1)
             self.assertTrue(any("fpcalc" in issue.message for issue in result.issues))
+
+    def test_fpcalc_must_be_launchable(self):
+        with patch("audiobook_finder.scanner.shutil.which", return_value="C:/tools/fpcalc.exe"), \
+                patch("audiobook_finder.scanner.subprocess.run") as run:
+            self.assertTrue(_fpcalc_available())
+            run.assert_called_once()
+
+            run.side_effect = OSError("access denied")
+            self.assertFalse(_fpcalc_available())
+
+    def test_directory_traversal_errors_are_reported(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def failing_walk(path, *, followlinks, onerror):
+                onerror(PermissionError("share is unavailable"))
+                return iter(())
+
+            with patch("audiobook_finder.scanner.os.walk", side_effect=failing_walk):
+                result = scan_directory(root)
+
+            self.assertEqual(len(result.issues), 1)
+            self.assertIn("Directory could not be scanned", result.issues[0].message)
 
 
 if __name__ == "__main__":
