@@ -13,6 +13,39 @@ function Write-Step([string]$Message) {
     Write-Host "`n==> $Message" -ForegroundColor Cyan
 }
 
+function New-AppShortcut {
+    $shell = $null
+    try {
+        $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+        if ([string]::IsNullOrWhiteSpace($desktop)) {
+            throw "The current user's Desktop folder could not be located."
+        }
+        $shortcutPath = Join-Path $desktop "Audiobook Duplicate Finder.lnk"
+        $pythonw = Join-Path $ProjectRoot ".venv\Scripts\pythonw.exe"
+        if (-not (Test-Path -LiteralPath $pythonw -PathType Leaf)) {
+            $pythonw = $VenvPython
+        }
+
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $pythonw
+        $shortcut.Arguments = "-m audiobook_finder.app"
+        $shortcut.WorkingDirectory = $ProjectRoot
+        $shortcut.Description = "Open Audiobook Duplicate Finder"
+        $shortcut.IconLocation = "$pythonw,0"
+        $shortcut.Save()
+        Write-Host "Created one-click launcher: $shortcutPath" -ForegroundColor DarkGreen
+    }
+    catch {
+        Write-Warning "Setup succeeded, but the Desktop shortcut could not be created: $_"
+    }
+    finally {
+        if ($shell) {
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+        }
+    }
+}
+
 function Test-PythonExecutable([string]$Executable) {
     if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
         return $null
@@ -223,6 +256,8 @@ try {
     else {
         Write-Warning "Optional fingerprint matching is not configured. Normal scanning works; add Chromaprint fpcalc to PATH or set FPCALC to its full path to enable it."
     }
+
+    New-AppShortcut
 
     Write-Host "`nSetup complete. No administrator access was used or required." -ForegroundColor Green
     if (-not $SkipLaunch) {

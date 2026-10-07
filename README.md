@@ -4,7 +4,7 @@ A Windows-first desktop tool for scanning audiobook libraries locally, finding l
 
 ## Run
 
-On Windows, double-click `Install Audiobook Duplicate Finder.bat` for a guided setup. It validates the project and optional library folder, finds Python 3.11 or newer or offers a per-user Python install through winget, creates `.venv`, installs the application dependencies, runs the test suite, saves the selected library as the app default, and can launch the app. You can also provide the library path directly:
+On Windows, double-click `Install Audiobook Duplicate Finder.bat` for a guided setup. It validates the project and optional library folder, finds Python 3.11 or newer or offers a per-user Python install through winget, creates `.venv`, installs the application dependencies, runs the test suite, saves the selected library as the app default, creates an **Audiobook Duplicate Finder** shortcut on the current user's Desktop, and can launch the app. After installation, double-click that shortcut whenever you want to scan for newly added files. You can also provide the library path directly:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -LibraryPath "D:\Audiobooks"
