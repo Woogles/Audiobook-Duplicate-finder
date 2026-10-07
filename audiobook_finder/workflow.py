@@ -30,11 +30,12 @@ def scan_and_process(
     on_progress: Callable[[int, str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     include_fingerprints: bool = False,
+    workers: int = 1,
 ) -> WorkflowResult:
     """Scan first; only after completion, move strong duplicates and return review cases."""
     root = root.expanduser().resolve(strict=True)
     LOGGER.info("Starting library scan at %s", root)
-    summary = scan_directory(root, on_progress, should_cancel, include_fingerprints)
+    summary = scan_directory(root, on_progress, should_cancel, include_fingerprints, workers)
     for issue in summary.issues:
         LOGGER.warning("Scan issue at %s: %s", issue.path, issue.message)
     if summary.cancelled:

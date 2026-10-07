@@ -24,15 +24,24 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
+from .benchmark import BenchmarkResult, benchmark_workers
 from .matching import Confidence, Edition, preference_key
 from .operations import move_edition, undo_last_move
 from .scanner import _fpcalc_available
-from .settings import load_library_path, save_library_path, settings_path, validate_library_path
+from .settings import (
+    MAX_SCAN_WORKERS,
+    load_library_path,
+    load_scan_workers,
+    save_library_path,
+    settings_path,
+    validate_library_path,
+)
 from .workflow import WorkflowResult, scan_and_process
 
 
@@ -81,11 +90,14 @@ class ScanWorker(QObject):
     completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, root: Path, cancellation: threading.Event, include_fingerprints: bool) -> None:
+    def __init__(
+        self, root: Path, cancellation: threading.Event, include_fingerprints: bool, workers: int
+    ) -> None:
         super().__init__()
         self.root = root
         self.cancellation = cancellation
         self.include_fingerprints = include_fingerprints
+        self.workers = workers
 
     def run(self) -> None:
         try:
@@ -94,10 +106,27 @@ class ScanWorker(QObject):
                 on_progress=lambda count, path: self.progress.emit(count, path),
                 should_cancel=self.cancellation.is_set,
                 include_fingerprints=self.include_fingerprints,
+                workers=self.workers,
             )
             self.completed.emit(result)
         except Exception as error:
             LOGGER.exception("Scan failed for %s", self.root)
+            self.failed.emit(str(error))
+
+
+class BenchmarkWorker(QObject):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(benchmark_workers(self.root))
+        except Exception as error:
+            LOGGER.exception("Worker benchmark failed for %s", self.root)
             self.failed.emit(str(error))
 
 
@@ -109,6 +138,8 @@ class MainWindow(QMainWindow):
         self.resize(1120, 760)
         self._thread: QThread | None = None
         self._worker: ScanWorker | None = None
+        self._benchmark_thread: QThread | None = None
+        self._benchmark_worker: BenchmarkWorker | None = None
         self._cancellation: threading.Event | None = None
         self._result: WorkflowResult | None = None
         self._review_groups = []
@@ -142,13 +173,27 @@ class MainWindow(QMainWindow):
         self.fingerprint_checkbox.setToolTip(
             "Use local Chromaprint via fpcalc to compare audio content across different names and encodings."
         )
+        actions.addWidget(self.scan_button)
+        actions.addWidget(self.fingerprint_checkbox)
+        actions.addWidget(QLabel("Workers"))
+        self.worker_spin = QSpinBox()
+        self.worker_spin.setRange(1, MAX_SCAN_WORKERS)
+        self.worker_spin.setValue(load_scan_workers())
+        self.worker_spin.setToolTip(
+            "Maximum audio files inspected at once. More workers can use more CPU and memory; lower this for a lighter scan."
+        )
+        actions.addWidget(self.worker_spin)
+        self.benchmark_button = QPushButton("Benchmark")
+        self.benchmark_button.setToolTip(
+            "Reads up to 96 MiB total from local audio files to compare worker counts. No files are changed."
+        )
+        self.benchmark_button.clicked.connect(self._start_benchmark)
+        actions.addWidget(self.benchmark_button)
         self.cancel_button = QPushButton("Cancel scan")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel_scan)
         self.undo_button = QPushButton("Undo last move")
         self.undo_button.clicked.connect(self._undo_move)
-        actions.addWidget(self.scan_button)
-        actions.addWidget(self.fingerprint_checkbox)
         actions.addWidget(self.cancel_button)
         actions.addStretch(1)
         actions.addWidget(self.undo_button)
@@ -252,7 +297,7 @@ class MainWindow(QMainWindow):
             return
         self.path_edit.setText(str(library_path))
         try:
-            save_library_path(library_path)
+            save_library_path(library_path, self.worker_spin.value())
         except OSError as error:
             QMessageBox.warning(self, "Could not save default folder", str(error))
         self._include_fingerprints = self.fingerprint_checkbox.isChecked()
@@ -288,7 +333,7 @@ class MainWindow(QMainWindow):
         self._cancellation = threading.Event()
         self._thread = QThread(self)
         self._worker = ScanWorker(
-            library_path, self._cancellation, self._include_fingerprints
+            library_path, self._cancellation, self._include_fingerprints, self.worker_spin.value()
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -299,6 +344,50 @@ class MainWindow(QMainWindow):
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._thread_finished)
         self._thread.start()
+
+    def _start_benchmark(self) -> None:
+        try:
+            library_path = validate_library_path(self.path_edit.text().strip())
+        except (ValueError, OSError) as error:
+            QMessageBox.warning(self, "Library folder unavailable", str(error))
+            return
+        self.path_edit.setText(str(library_path))
+        self.status.setText("Benchmarking local read speed; files will not be changed…")
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.show()
+        self._set_running(True)
+        self.cancel_button.setEnabled(False)
+        self._benchmark_thread = QThread(self)
+        self._benchmark_worker = BenchmarkWorker(library_path)
+        self._benchmark_worker.moveToThread(self._benchmark_thread)
+        self._benchmark_thread.started.connect(self._benchmark_worker.run)
+        self._benchmark_worker.completed.connect(self._benchmark_completed)
+        self._benchmark_worker.failed.connect(self._benchmark_failed)
+        self._benchmark_worker.completed.connect(self._benchmark_thread.quit)
+        self._benchmark_worker.failed.connect(self._benchmark_thread.quit)
+        self._benchmark_thread.finished.connect(self._benchmark_thread_finished)
+        self._benchmark_thread.start()
+
+    def _benchmark_completed(self, result: BenchmarkResult) -> None:
+        self.worker_spin.setValue(result.recommended_workers)
+        rates = ", ".join(f"{workers}: {rate:.1f} MiB/s" for workers, rate in result.throughput_mib_per_second)
+        self.status.setText(
+            f"Recommended {result.recommended_workers} worker(s) · {result.files_sampled} files sampled · "
+            f"{result.bytes_read / (1024 * 1024):.1f} MiB read · throughput by workers: {rates}. "
+            "Drive cache and other activity can affect results."
+        )
+
+    def _benchmark_failed(self, message: str) -> None:
+        self.status.setText("Worker benchmark could not be completed.")
+        QMessageBox.warning(self, "Benchmark failed", message)
+
+    def _benchmark_thread_finished(self) -> None:
+        self._set_running(False)
+        self.progress_bar.hide()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self._benchmark_worker = None
+        self._benchmark_thread = None
 
     def _scan_progress(self, count: int, path: str) -> None:
         self.status.setText(f"Scanned {count:,} files · {path}")
@@ -348,6 +437,8 @@ class MainWindow(QMainWindow):
         self.browse_button.setEnabled(not running)
         self.path_edit.setEnabled(not running)
         self.fingerprint_checkbox.setEnabled(not running)
+        self.worker_spin.setEnabled(not running)
+        self.benchmark_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
         self.undo_button.setEnabled(not running)
 

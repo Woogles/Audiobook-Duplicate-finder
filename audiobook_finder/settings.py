@@ -7,6 +7,10 @@ import os
 from pathlib import Path
 
 
+DEFAULT_SCAN_WORKERS = min(4, os.cpu_count() or 1)
+MAX_SCAN_WORKERS = 32
+
+
 def settings_path() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     return base / "AudiobookDuplicateFinder" / "settings.json"
@@ -30,12 +34,13 @@ def validate_library_path(value: str | Path) -> Path:
     return path
 
 
-def save_library_path(value: str | Path) -> Path:
+def save_library_path(value: str | Path, scan_workers: int | None = None) -> Path:
     path = validate_library_path(value)
+    workers = load_scan_workers() if scan_workers is None else max(1, min(MAX_SCAN_WORKERS, int(scan_workers)))
     destination = settings_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
-        json.dumps({"library_path": str(path)}, indent=2),
+        json.dumps({"library_path": str(path), "scan_workers": workers}, indent=2),
         encoding="utf-8",
     )
     return path
@@ -43,7 +48,17 @@ def save_library_path(value: str | Path) -> Path:
 
 def load_library_path() -> str:
     try:
-        value = json.loads(settings_path().read_text(encoding="utf-8-sig")).get("library_path", "")
+        settings = json.loads(settings_path().read_text(encoding="utf-8-sig"))
+        value = settings.get("library_path", "") if isinstance(settings, dict) else ""
         return str(validate_library_path(value)) if value else ""
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return ""
+
+
+def load_scan_workers() -> int:
+    try:
+        settings = json.loads(settings_path().read_text(encoding="utf-8-sig"))
+        value = settings.get("scan_workers", DEFAULT_SCAN_WORKERS) if isinstance(settings, dict) else DEFAULT_SCAN_WORKERS
+        return max(1, min(MAX_SCAN_WORKERS, int(value)))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return DEFAULT_SCAN_WORKERS

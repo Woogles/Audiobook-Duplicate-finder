@@ -6,6 +6,8 @@ import hashlib
 import os
 import shutil
 import subprocess
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
@@ -191,8 +193,9 @@ def scan_directory(
     on_progress: Callable[[int, str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     include_fingerprints: bool = False,
+    workers: int = 1,
 ) -> ScanSummary:
-    """Recursively scan supported audio files; the source tree is never changed."""
+    """Recursively inspect supported audio files with bounded concurrency."""
     root = root.expanduser().resolve(strict=True)
     if not root.is_dir():
         raise NotADirectoryError(root)
@@ -219,27 +222,77 @@ def scan_directory(
             if candidate.suffix.casefold() in AUDIO_EXTENSIONS and not candidate.is_symlink():
                 candidates.append(candidate)
 
-    discovered: list[AudioFileInfo] = []
     fingerprinting = include_fingerprints
     if fingerprinting and not _fpcalc_available():
         issues.append(ScanIssue(str(root), "Audio fingerprinting needs the Chromaprint fpcalc executable."))
         fingerprinting = False
-    for index, candidate in enumerate(sorted(candidates), start=1):
-        if should_cancel and should_cancel():
-            return ScanSummary(tuple(discovered), tuple(issues), cancelled=True)
-        if on_progress:
-            on_progress(index, str(candidate))
-        try:
-            item = inspect_file(candidate, should_cancel)
-            if fingerprinting:
+
+    candidates.sort()
+    worker_count = max(1, int(workers))
+    cancellation_lock = threading.Lock()
+
+    def is_cancelled() -> bool:
+        if should_cancel is None:
+            return False
+        with cancellation_lock:
+            return should_cancel()
+
+    def inspect_candidate(candidate: Path) -> tuple[AudioFileInfo, ScanIssue | None]:
+        item = inspect_file(candidate, is_cancelled)
+        fingerprint_issue = None
+        if fingerprinting:
+            try:
+                duration, fingerprint = _fingerprint_audio(candidate)
+                item = replace(item, fingerprint_duration=duration, fingerprint=fingerprint)
+            except Exception as error:
+                fingerprint_issue = ScanIssue(str(candidate), f"Fingerprint unavailable: {error}")
+        return item, fingerprint_issue
+
+    discovered: dict[Path, AudioFileInfo] = {}
+    file_issues: list[ScanIssue] = []
+    pending = {}
+    next_candidate = 0
+    completed_count = 0
+    cancelled = False
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        while next_candidate < len(candidates) or pending:
+            if is_cancelled():
+                cancelled = True
+                break
+
+            while next_candidate < len(candidates) and len(pending) < worker_count * 2:
+                if is_cancelled():
+                    cancelled = True
+                    break
+                candidate = candidates[next_candidate]
+                next_candidate += 1
+                pending[executor.submit(inspect_candidate, candidate)] = candidate
+            if cancelled or not pending:
+                break
+
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                candidate = pending.pop(future)
                 try:
-                    duration, fingerprint = _fingerprint_audio(candidate)
-                    item = replace(item, fingerprint_duration=duration, fingerprint=fingerprint)
+                    item, fingerprint_issue = future.result()
+                    discovered[candidate] = item
+                    if fingerprint_issue:
+                        file_issues.append(fingerprint_issue)
+                except ScanCancelled:
+                    cancelled = True
                 except Exception as error:
-                    issues.append(ScanIssue(str(candidate), f"Fingerprint unavailable: {error}"))
-            discovered.append(item)
-        except ScanCancelled:
-            return ScanSummary(tuple(discovered), tuple(issues), cancelled=True)
-        except Exception as error:
-            issues.append(ScanIssue(str(candidate), str(error)))
-    return ScanSummary(tuple(discovered), tuple(issues))
+                    file_issues.append(ScanIssue(str(candidate), str(error)))
+                completed_count += 1
+                if on_progress:
+                    on_progress(completed_count, str(candidate))
+
+            if cancelled:
+                break
+
+        if cancelled:
+            for future in pending:
+                future.cancel()
+
+    ordered_files = tuple(discovered[candidate] for candidate in candidates if candidate in discovered)
+    issues.extend(sorted(file_issues, key=lambda issue: (issue.path.casefold(), issue.message)))
+    return ScanSummary(ordered_files, tuple(issues), cancelled=cancelled)

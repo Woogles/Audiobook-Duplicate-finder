@@ -1,9 +1,10 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from audiobook_finder.scanner import AUDIO_EXTENSIONS, _fpcalc_available, scan_directory
+from audiobook_finder.scanner import AUDIO_EXTENSIONS, AudioFileInfo, _fpcalc_available, scan_directory
 
 
 class ScannerTests(unittest.TestCase):
@@ -37,6 +38,40 @@ class ScannerTests(unittest.TestCase):
 
             self.assertTrue(result.cancelled)
             self.assertEqual(result.files, ())
+
+    def test_scan_inspects_files_concurrently_and_returns_sorted_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [root / name for name in ("c.mp3", "a.mp3", "b.mp3")]
+            for path in paths:
+                path.write_bytes(b"audio")
+
+            active = 0
+            maximum_active = 0
+            lock = threading.Lock()
+            barrier = threading.Barrier(2)
+
+            def inspect(path, _should_cancel):
+                nonlocal active, maximum_active
+                with lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                try:
+                    if path.name != "c.mp3":
+                        barrier.wait(timeout=2)
+                    return AudioFileInfo(
+                        str(path), 5, path.name, path.stem, "", "", "", 0.0, 0,
+                        False, 0, False, 0,
+                    )
+                finally:
+                    with lock:
+                        active -= 1
+
+            with patch("audiobook_finder.scanner.inspect_file", side_effect=inspect):
+                result = scan_directory(root, workers=2)
+
+            self.assertEqual(maximum_active, 2)
+            self.assertEqual([Path(item.path).name for item in result.files], ["a.mp3", "b.mp3", "c.mp3"])
 
     def test_scan_can_cancel_while_hashing_a_large_file(self):
         with tempfile.TemporaryDirectory() as temporary:
